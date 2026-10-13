@@ -6,6 +6,7 @@ from typing import Final
 from pydantic import TypeAdapter
 
 from litellm.litellm_core_utils.request_timeout_resolver import get_configured_request_timeout
+from litellm.litellm_core_utils.service_tier_timeout import resolve_service_tier_timeout
 
 DEFAULT_PASS_THROUGH_REQUEST_TIMEOUT_SECONDS: Final = 600.0
 
@@ -63,6 +64,15 @@ def resolve_llm_passthrough_timeout(
     """
     request: Final = kwargs if kwargs is not None else _NO_PARAMS
     deployment: Final = litellm_params if litellm_params is not None else _NO_PARAMS
+    tier_timeout: Final = resolve_service_tier_timeout(request, deployment)
+    if tier_timeout is not None:
+        tier_candidates: Final = (
+            request.get("stream_timeout") if request.get("stream") else None,
+            request.get("timeout"),
+            request.get("request_timeout"),
+            tier_timeout,
+        )
+        return _SECONDS.validate_python(next(value for value in tier_candidates if value is not None))
     stream_candidates: Final = (
         (request.get("stream_timeout"), deployment.get("stream_timeout"), router_stream_timeout)
         if request.get("stream")

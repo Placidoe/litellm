@@ -117,6 +117,7 @@ from litellm.litellm_core_utils.sensitive_data_masker import (
     SensitiveDataMasker,
     mask_sensitive_structure,
 )
+from litellm.litellm_core_utils.service_tier_timeout import resolve_service_tier_timeout
 from litellm.litellm_core_utils.token_counter import offload_token_count
 from litellm.llms.anthropic.common_utils import AnthropicModelInfo, anthropic_error_frame_exception
 from litellm.llms.base_llm.passthrough.transformation import replace_path_segment
@@ -502,6 +503,7 @@ _SILENT_MODEL_ADAPTER: Final = TypeAdapter(str | list[str])
 _RESOLVED_RETRY_POLICY_ADAPTER: Final = TypeAdapter(RetryPolicy | None)
 _ROUTING_KWARGS_ADAPTER: Final[TypeAdapter[Mapping[str, object] | None]] = TypeAdapter(Mapping[str, object] | None)
 _FALLBACK_HOP_ADAPTER: Final = TypeAdapter(Mapping[str, object])
+_SERVICE_TIER_CALL_TIMEOUT_ADAPTER: Final = TypeAdapter(float)
 _DEPLOYMENT_SELECTED_EVENT: Final = "litellm.request.deployment_selected"
 
 
@@ -4341,8 +4343,25 @@ class Router:
         )
         return timeout
 
-    def _get_timeout(self, kwargs: dict, data: dict) -> float | int | None:
+    def _get_timeout(self, kwargs: dict, data: dict) -> float | int | httpx.Timeout | None:
         """Helper to get timeout from kwargs or deployment params"""
+        if "timeout_by_service_tier" in data or "stream_timeout_by_service_tier" in data:
+            request: Final = _FALLBACK_HOP_ADAPTER.validate_python(kwargs)
+            deployment_params: Final = _FALLBACK_HOP_ADAPTER.validate_python(data)
+            tier_timeout: Final = resolve_service_tier_timeout(request, deployment_params)
+            if tier_timeout is not None:
+                caller_timeout: Final = (
+                    (request.get("stream_timeout") if request.get("stream") else None)
+                    or request.get("timeout")
+                    or request.get("request_timeout")
+                )
+                if isinstance(caller_timeout, httpx.Timeout):
+                    return caller_timeout
+                return (
+                    _SERVICE_TIER_CALL_TIMEOUT_ADAPTER.validate_python(caller_timeout)
+                    if caller_timeout is not None
+                    else tier_timeout
+                )
         timeout: float | int | None = None
         if kwargs.get("stream", False):
             timeout = self._get_stream_timeout(kwargs=kwargs, data=data)

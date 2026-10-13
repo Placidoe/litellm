@@ -20,7 +20,9 @@ from litellm.types.utils import LlmProviders
 
 _V = TypeVar("_V")
 
-ROUTER_ONLY_CALL_KWARGS: Final = frozenset({"silent_model", "include_fallback_errors"})
+ROUTER_ONLY_CALL_KWARGS: Final = frozenset(
+    {"silent_model", "include_fallback_errors", "timeout_by_service_tier", "stream_timeout_by_service_tier"}
+)
 _OBJECT_MAPPING_ADAPTER: Final[TypeAdapter[Mapping[object, object]]] = TypeAdapter(Mapping[object, object])
 
 

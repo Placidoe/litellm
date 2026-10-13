@@ -15,6 +15,169 @@ import litellm
 from litellm import Router
 import time
 from unittest.mock import patch, MagicMock
+from pydantic import ValidationError
+from litellm.types.router import LiteLLM_Params
+
+
+@pytest.mark.parametrize(
+    ("request_params", "expected"),
+    [
+        ({"service_tier": "flex"}, 900),
+        ({"service_tier": "default"}, 600),
+        ({"service_tier": "unknown"}, 600),
+        ({}, 600),
+        ({"service_tier": "flex", "timeout": 15}, 15),
+        ({"service_tier": "flex", "request_timeout": 20}, 20),
+        ({"service_tier": "flex", "stream": True}, 950),
+        ({"service_tier": "flex", "stream": True, "stream_timeout": 10}, 10),
+        ({"service_tier": "flex", "stream": True, "timeout": 15}, 15),
+        ({"service_tier": "default", "stream": True}, 610),
+    ],
+)
+def test_service_tier_timeout_preserves_caller_overrides(request_params: dict[str, object], expected: float) -> None:
+    router: Final = Router(model_list=[], timeout=300)
+    deployment: Final = {
+        "timeout": 600,
+        "stream_timeout": 610,
+        "timeout_by_service_tier": {"flex": 900},
+        "stream_timeout_by_service_tier": {"flex": 950},
+    }
+    assert router._get_timeout(kwargs=request_params, data=deployment) == expected
+
+
+def test_generic_service_tier_timeout_also_covers_streaming() -> None:
+    router: Final = Router(model_list=[])
+    assert (
+        router._get_timeout(
+            kwargs={"stream": True, "service_tier": "flex"},
+            data={"stream_timeout": 600, "timeout_by_service_tier": {"flex": 900}},
+        )
+        == 900
+    )
+
+
+def test_service_tier_timeout_uses_deployment_default_tier() -> None:
+    router: Final = Router(model_list=[])
+    deployment: Final = {"timeout": 600, "service_tier": "flex", "timeout_by_service_tier": {"flex": 900}}
+    assert router._get_timeout(kwargs={}, data=deployment) == 900
+    assert router._get_timeout(kwargs={"service_tier": "default"}, data=deployment) == 600
+
+
+def test_service_tier_timeout_preserves_httpx_caller_timeout() -> None:
+    router: Final = Router(model_list=[])
+    caller_timeout: Final = httpx.Timeout(15, read=30)
+    assert (
+        router._get_timeout(
+            kwargs={"service_tier": "flex", "timeout": caller_timeout},
+            data={"timeout_by_service_tier": {"flex": 900}},
+        )
+        is caller_timeout
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["chat", "responses"])
+@pytest.mark.parametrize("caller_timeout", [None, 15])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_service_tier_timeout_reaches_http_transport_without_leaking_config(
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+    caller_timeout: int | None,
+    stream: bool,
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    route: Final = respx_mock.post(url__regex=r"^https://api.openai.com/v1/(chat/completions|responses)$").mock(
+        side_effect=httpx.ReadTimeout("upstream timeout")
+    )
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "tier-timeout-test",
+                "litellm_params": {
+                    "model": "openai/test-model",
+                    "api_key": "test-key",
+                    "timeout": 600,
+                    "timeout_by_service_tier": {"flex": 900},
+                    "stream_timeout_by_service_tier": {"flex": 950},
+                },
+            }
+        ],
+        num_retries=0,
+    )
+    request_params: Final = {"timeout": caller_timeout} if caller_timeout is not None else {}
+    call: Final = (
+        router.acompletion(
+            model="tier-timeout-test",
+            messages=[{"role": "user", "content": "hi"}],
+            service_tier="flex",
+            stream=stream,
+            **request_params,
+        )
+        if surface == "chat"
+        else router.aresponses(
+            model="tier-timeout-test", input="hi", service_tier="flex", stream=stream, **request_params
+        )
+    )
+    with pytest.raises(litellm.Timeout):
+        await call
+    assert route.call_count == 1
+    request_body: Final = json.loads(route.calls[0].request.content)
+    assert request_body["service_tier"] == "flex"
+    assert "timeout_by_service_tier" not in request_body
+    assert "stream_timeout_by_service_tier" not in request_body
+    assert route.calls[0].request.extensions["timeout"]["read"] == (caller_timeout or (950 if stream else 900))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["chat", "responses"])
+async def test_service_tier_timeout_is_recomputed_on_fallback(
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    route: Final = respx_mock.post(url__regex=r"^https://api.openai.com/v1/(chat/completions|responses)$").mock(
+        side_effect=httpx.ReadTimeout("upstream timeout")
+    )
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "primary",
+                "litellm_params": {
+                    "model": "openai/primary",
+                    "api_key": "test-key",
+                    "timeout_by_service_tier": {"flex": 900},
+                },
+            },
+            {
+                "model_name": "fallback",
+                "litellm_params": {
+                    "model": "openai/fallback",
+                    "api_key": "test-key",
+                    "timeout_by_service_tier": {"flex": 450},
+                },
+            },
+        ],
+        fallbacks=[{"primary": ["fallback"]}],
+        num_retries=0,
+    )
+    call: Final = (
+        router.acompletion(model="primary", messages=[{"role": "user", "content": "hi"}], service_tier="flex")
+        if surface == "chat"
+        else router.aresponses(model="primary", input="hi", service_tier="flex")
+    )
+    with pytest.raises(litellm.Timeout):
+        await call
+    assert route.call_count == 2
+    assert tuple(call.request.extensions["timeout"]["read"] for call in route.calls) == (900, 450)
+
+
+@pytest.mark.parametrize("seconds", [0, -1, True, "900", float("inf"), float("nan")])
+@pytest.mark.parametrize("field", ["timeout_by_service_tier", "stream_timeout_by_service_tier"])
+def test_service_tier_timeout_configuration_rejects_invalid_seconds(field: str, seconds: object) -> None:
+    with pytest.raises(ValidationError):
+        LiteLLM_Params.model_validate({"model": "openai/test-model", field: {"flex": seconds}})
 
 
 @pytest.fixture

@@ -1727,6 +1727,25 @@ def test_resolve_pass_through_request_timeout_precedence():
         assert resolve_pass_through_request_timeout() == DEFAULT_PASS_THROUGH_REQUEST_TIMEOUT_SECONDS
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("caller_timeout", [None, 15])
+def test_resolve_llm_passthrough_service_tier_timeout(stream: bool, caller_timeout: int | None) -> None:
+    request: Final = {
+        "service_tier": "flex",
+        "stream": stream,
+        **({"timeout": caller_timeout} if caller_timeout else {}),
+    }
+    assert resolve_llm_passthrough_timeout(
+        kwargs=request,
+        litellm_params={
+            "timeout": 600,
+            "stream_timeout": 610,
+            "timeout_by_service_tier": {"flex": 900},
+            "stream_timeout_by_service_tier": {"flex": 950},
+        },
+    ) == (caller_timeout or (950 if stream else 900))
+
+
 def test_resolve_llm_passthrough_timeout_precedence():
     assert resolve_llm_passthrough_timeout(kwargs={"timeout": 45}) == 45.0
     assert (
