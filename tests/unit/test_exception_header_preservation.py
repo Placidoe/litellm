@@ -25,6 +25,64 @@ from litellm.exceptions import (
 )
 
 
+@pytest.mark.parametrize(
+    ("provider", "message", "headers", "expected"),
+    [
+        ("groq", "Please try again in 37s", {}, 37),
+        ("groq", "Please try again in 1m2.3s", {}, 63),
+        ("vertex_ai_beta", '{"retryDelay": "0.5s"}', {}, 1),
+        ("vertex_ai", '{"retryDelay": "37s"}', {}, 37),
+        ("gemini", '{"retryDelay": "37.1s"}', {}, 38),
+        ("openai", "too many requests", {"Retry-After": "12"}, 12),
+        ("openai", "too many requests", {"retry-after-ms": "1500"}, 2),
+        ("openai", "too many requests", {"retry-after-ms": "500", "retry-after": "8"}, 1),
+        ("groq", "try again in 37s", {"retry-after": "5"}, 5),
+        ("openai", "too many requests", {"retry-after": "0"}, 0),
+        ("openai", "too many requests", {"retry-after": "-1"}, None),
+        ("openai", "too many requests", {"retry-after": "NaN"}, None),
+        ("openai", "too many requests", {"retry-after": "Infinity"}, None),
+        ("openai", "too many requests", {"retry-after": "nonsense"}, None),
+        ("openai", "try again in 37s", {}, None),
+        ("groq", "quota exceeded", {}, None),
+    ],
+)
+def test_rate_limit_error_exposes_retry_delay(
+    provider: str, message: str, headers: dict[str, str], expected: int | None
+) -> None:
+    error: Final = RateLimitError(message=message, llm_provider=provider, model="test-model", headers=headers)
+    assert error.retry_after == expected
+
+
+def test_rate_limit_retry_delay_reads_vendor_headers_without_forwarding_them() -> None:
+    response: Final = httpx.Response(429, headers={"retry-after": "17", "set-cookie": "vendor=private"})
+    error: Final = RateLimitError(message="rate limited", llm_provider="openai", model="test-model", response=response)
+    assert error.retry_after == 17
+    assert error.headers is None
+    assert error.response.headers["set-cookie"] == "vendor=private"
+
+
+def test_rate_limit_retry_delay_explicit_headers_override_vendor_headers() -> None:
+    response: Final = httpx.Response(429, headers={"Retry-After": "17"})
+    error: Final = RateLimitError(
+        message="rate limited",
+        llm_provider="openai",
+        model="test-model",
+        response=response,
+        headers={"RETRY-AFTER": "3"},
+    )
+    assert error.retry_after == 3
+    assert error.response.headers["retry-after"] == "17"
+
+
+def test_midstream_fallback_keeps_original_rate_limit_delay() -> None:
+    original: Final = RateLimitError(message="try again in 2.3s", llm_provider="groq", model="test-model")
+    error: Final = MidStreamFallbackError(
+        message="stream failed", llm_provider="groq", model="test-model", original_exception=original
+    )
+    assert isinstance(error.original_exception, RateLimitError)
+    assert error.original_exception.retry_after == 3
+
+
 class TestExceptionHeaderPreservation:
     """Test that exception classes preserve headers from provider responses."""
 
@@ -43,9 +101,7 @@ class TestExceptionHeaderPreservation:
             request=transport.Request("POST", "https://api.openai.com/v1/chat/completions"),
         )
 
-    def test_bad_request_error_preserves_headers(
-        self, mock_response_with_headers: httpx.Response
-    ):
+    def test_bad_request_error_preserves_headers(self, mock_response_with_headers: httpx.Response):
         """BadRequestError should preserve headers from the provider response."""
         error = BadRequestError(
             message="Invalid request",
@@ -61,9 +117,7 @@ class TestExceptionHeaderPreservation:
         assert error.response.headers.get("x-ms-region") == "eastus"
         assert error.response.headers.get("x-ratelimit-remaining-requests") == "99"
 
-    def test_payment_required_error_preserves_headers(
-        self, mock_response_with_headers: httpx.Response
-    ):
+    def test_payment_required_error_preserves_headers(self, mock_response_with_headers: httpx.Response):
         """PaymentRequiredError should keep the provider response like its BadRequestError parent."""
         error = PaymentRequiredError(
             message="Insufficient credit",
@@ -78,9 +132,7 @@ class TestExceptionHeaderPreservation:
         assert error.request_id == mock_response_with_headers.headers["x-request-id"]
         assert error.response.headers.get("x-ms-region") == "eastus"
 
-    def test_content_policy_violation_error_preserves_headers(
-        self, mock_response_with_headers: httpx.Response
-    ):
+    def test_content_policy_violation_error_preserves_headers(self, mock_response_with_headers: httpx.Response):
         """ContentPolicyViolationError should preserve headers from the provider response."""
         error = ContentPolicyViolationError(
             message="Content policy violation",
@@ -93,9 +145,7 @@ class TestExceptionHeaderPreservation:
         assert error.response.headers.get("x-request-id") == "req-abc123"
         assert error.response.headers.get("x-ms-region") == "eastus"
 
-    def test_context_window_exceeded_error_preserves_headers(
-        self, mock_response_with_headers: httpx.Response
-    ):
+    def test_context_window_exceeded_error_preserves_headers(self, mock_response_with_headers: httpx.Response):
         """ContextWindowExceededError should preserve headers from the provider response."""
         error = ContextWindowExceededError(
             message="Context window exceeded",
@@ -108,9 +158,7 @@ class TestExceptionHeaderPreservation:
         assert error.response.headers.get("x-request-id") == "req-abc123"
         assert error.response.headers.get("x-ms-region") == "eastus"
 
-    def test_image_fetch_error_preserves_headers(
-        self, mock_response_with_headers: httpx.Response
-    ):
+    def test_image_fetch_error_preserves_headers(self, mock_response_with_headers: httpx.Response):
         """ImageFetchError should preserve headers from the provider response."""
         error = ImageFetchError(
             message="Failed to fetch image",
@@ -213,10 +261,7 @@ class TestExceptionAttributes:
         )
 
         assert error.provider_specific_fields == provider_fields
-        assert (
-            error.provider_specific_fields["innererror"]["code"]
-            == "ResponsibleAIPolicyViolation"
-        )
+        assert error.provider_specific_fields["innererror"]["code"] == "ResponsibleAIPolicyViolation"
 
     def test_bad_request_error_attributes(self):
         """BadRequestError should set all expected attributes."""
@@ -241,9 +286,7 @@ class TestExceptionAttributes:
         MidStreamFallbackError should preserve the original status code and keep
         message/request/response fields consistent after super().__init__().
         """
-        original_req = httpx.Request(
-            "POST", "https://api.openai.com/v1/chat/completions"
-        )
+        original_req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
         original_resp = httpx.Response(status_code=429, request=original_req)
 
         rate_limit_error = RateLimitError(

@@ -17,6 +17,7 @@ import httpx
 import openai
 
 import litellm
+from litellm.litellm_core_utils.retry_after import rate_limit_retry_after
 from litellm.types.utils import LiteLLMCommonStrings
 from litellm.types.vector_stores import VectorStoreSearchFailure
 
@@ -458,8 +459,8 @@ class RateLimitError(openai.RateLimitError):
 
     def __init__(
         self,
-        message,
-        llm_provider,
+        message: str,
+        llm_provider: str,
         model,
         response: httpx.Response | None = None,
         litellm_debug_info: str | None = None,
@@ -500,6 +501,11 @@ class RateLimitError(openai.RateLimitError):
         # makes it onto `self.headers`.
         _response_headers: Final = getattr(response, "headers", None) if response is not None else None
         self.headers: dict[str, str] | None = {k: str(v) for k, v in headers.items()} if headers else None
+        self.retry_after: int | None = rate_limit_retry_after(
+            message=message,
+            provider=llm_provider,
+            headers=httpx.Headers({**httpx.Headers(_response_headers), **httpx.Headers(self.headers)}),
+        )
         # Mirrors FastAPI HTTPException.detail so the same instance can be
         # serialized through both the ProxyException and HTTPException paths.
         self.detail = detail if detail is not None else self.message
