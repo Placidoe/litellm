@@ -948,6 +948,8 @@ class LiteLLMRoutes(enum.Enum):
     )
 
     self_managed_routes = [
+        "/telemetry/ui_events",
+        "/telemetry/ui_events/enabled",
         # update_team resolves proxy/org/team admin itself and filters team admins
         # through the team_admin_editable_team_fields setting
         "/team/update",
@@ -1068,6 +1070,7 @@ class LiteLLMRoutes(enum.Enum):
     # updating this list — the default-allow behavior covers it automatically.
     admin_viewer_routes = (
         [
+            "/telemetry/ui_events",
             "/lens/traces/findings",
             "/lens/feedback/summary",
             "/user/list",
